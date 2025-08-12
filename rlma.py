@@ -8,14 +8,17 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.decomposition import PCA
+from sklearn.metrics import mutual_info_score
+from sklearn.preprocessing import KBinsDiscretizer, LabelEncoder
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA
+from scipy.stats import spearmanr
+from joblib import Parallel, delayed
+import plotly.express as px
+import plotly.graph_objects as go
 
 def describe_data(arr, var_name='Variable'):
-    """
-    Print descriptive statistics and plot histogram and boxplot of a numeric array.
-    """
     arr = np.asarray(arr)
     print(f"\nDescriptive Statistics for '{var_name}':")
     print(f"Count: {len(arr)}")
@@ -26,7 +29,6 @@ def describe_data(arr, var_name='Variable'):
     print(f"Max: {np.max(arr):.3f}")
     print(f"25th Percentile: {np.percentile(arr, 25):.3f}")
     print(f"75th Percentile: {np.percentile(arr, 75):.3f}")
-
     plt.figure(figsize=(12,4))
     plt.subplot(1,2,1)
     sns.histplot(arr, kde=True, bins=20, color='skyblue')
@@ -36,151 +38,171 @@ def describe_data(arr, var_name='Variable'):
     plt.title(f'Boxplot of {var_name}')
     plt.show()
 
-def categorize_variable_percentile(arr, num_categories=3):
+def categorize_variable(arr, num_categories=3, strategy='quantile'):
     """
-    Categorize a numeric array into discrete levels based on percentiles.
-    Default splits into 3 categories: Low (<=33rd), Moderate (33rd-66th), High (>66th).
-    Returns an array of category labels: 0 (Low), 1 (Moderate), 2 (High).
+    Categorize numeric or ordinal array into discrete bins.
+    Supports any number of categories and strategies ('quantile', 'uniform', 'kmeans').
+    Handles binary variables automatically.
+    Returns integer category labels.
     """
     arr = np.asarray(arr)
-    if num_categories != 3:
-        raise NotImplementedError("Only 3-category version implemented")
+    if set(np.unique(arr)).issubset({0,1}):
+        # Binary data remains unchanged
+        return arr.astype(int)
     
-    p33 = np.percentile(arr, 33)
-    p66 = np.percentile(arr, 66)
-    
-    categories = np.zeros_like(arr, dtype=int)
-    categories[arr <= p33] = 0  # Low
-    categories[(arr > p33) & (arr <= p66)] = 1  # Moderate
-    categories[arr > p66] = 2  # High
-    
+    discretizer = KBinsDiscretizer(n_bins=num_categories, encode='ordinal', strategy=strategy)
+    arr_reshaped = arr.reshape(-1,1)
+    categories = discretizer.fit_transform(arr_reshaped).astype(int).flatten()
     return categories
 
-def plot_category_match(x_cat, y_cat, var_x='X', var_y='Y'):
+def continuous_similarity_score(x, y):
     """
-    Plot a heatmap showing counts of category matches between x_cat and y_cat.
+    Compute similarity score between continuous arrays, scaled 0-1.
+    Uses 1 - normalized absolute difference.
     """
-    import matplotlib.ticker as ticker
+    x = np.asarray(x)
+    y = np.asarray(y)
+    max_range = np.max([np.max(x) - np.min(x), np.max(y) - np.min(y), 1e-8])
+    norm_diff = np.abs(x - y) / max_range
+    similarity = 1 - norm_diff
+    return np.clip(similarity, 0, 1)
 
-    contingency = pd.crosstab(x_cat, y_cat)
-    plt.figure(figsize=(6,5))
-    sns.heatmap(contingency, annot=True, fmt='d', cmap='YlGnBu')
-    plt.xlabel(f'{var_y} Categories')
-    plt.ylabel(f'{var_x} Categories')
-    plt.title(f'Category Match Counts: {var_x} vs {var_y}')
-    plt.xticks(rotation=0)
-    plt.yticks(rotation=0)
-    plt.gca().xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    plt.show()
-
-def rmi_single_pair(x, y, num_categories=3, alpha=0.5, plot=False, var_names=('X', 'Y')):
+def adaptive_alpha(x_cat, y_cat):
     """
-    Compute Robust Linear Matching Index (RMI) between two variables x and y.
-    - Supports continuous and binary data.
-    - alpha: weight for near matches (categories adjacent).
-    - plot: if True, plot category match heatmap and distributions.
-    - var_names: tuple of (x_name, y_name) for labeling plots.
+    Adaptively determine alpha weight for near matches,
+    based on category distribution overlap.
+    """
+    total = len(x_cat)
+    near_matches = np.sum(np.abs(x_cat - y_cat) == 1)
+    exact_matches = np.sum(x_cat == y_cat)
+    if near_matches == 0:
+        return 0
+    alpha = near_matches / (near_matches + exact_matches)
+    return np.clip(alpha, 0.1, 0.9)  # keep alpha sensible
+
+def compute_rmi(x, y, num_categories=3, alpha=None, hybrid=True, plot=False, var_names=('X', 'Y')):
+    """
+    Compute Robust Linear Matching Index (RMI) between x and y.
+    - Supports numeric, binary, ordinal data.
+    - num_categories: number of categories for discretization.
+    - alpha: near-match weight; if None, computed adaptively.
+    - hybrid: if True, combine categorical matches with continuous similarity.
+    - plot: display descriptive stats and match heatmaps.
     """
     x = np.asarray(x)
     y = np.asarray(y)
     
-    # Describe data
+    # Describe data if plot enabled
     if plot:
         describe_data(x, var_names[0])
         describe_data(y, var_names[1])
     
-    # Handle binary variables (only categories 0 or 1)
-    unique_x = np.unique(x)
-    unique_y = np.unique(y)
-    if set(unique_x).issubset({0,1}):
-        x_cat = x
+    # Categorize variables
+    x_cat = categorize_variable(x, num_categories)
+    y_cat = categorize_variable(y, num_categories)
+    
+    if alpha is None:
+        alpha = adaptive_alpha(x_cat, y_cat)
+    
+    # Calculate categorical match scores
+    exact_matches = np.sum(x_cat == y_cat)
+    near_matches = np.sum(np.abs(x_cat - y_cat) == 1)
+    total = len(x_cat)
+    
+    cat_score = (exact_matches + alpha * near_matches) / total
+    
+    if not hybrid:
+        rmi_score = cat_score
     else:
-        x_cat = categorize_variable_percentile(x, num_categories)
-    if set(unique_y).issubset({0,1}):
-        y_cat = y
-    else:
-        y_cat = categorize_variable_percentile(y, num_categories)
-
+        # Calculate continuous similarity average
+        cont_sim = continuous_similarity_score(x, y).mean()
+        # Combine categorical and continuous similarity scores equally weighted
+        rmi_score = 0.5 * cat_score + 0.5 * cont_sim
+    
     if plot:
-        # Plot category match heatmap
-        plot_category_match(x_cat, y_cat, var_x=var_names[0], var_y=var_names[1])
-
-        # Plot category distributions side by side
+        # Heatmap of category matches
+        contingency = pd.crosstab(x_cat, y_cat)
+        plt.figure(figsize=(6,5))
+        sns.heatmap(contingency, annot=True, fmt='d', cmap='YlGnBu')
+        plt.xlabel(f'{var_names[1]} Categories')
+        plt.ylabel(f'{var_names[0]} Categories')
+        plt.title(f'Category Match Counts: {var_names[0]} vs {var_names[1]}')
+        plt.show()
+        
+        # Category distribution plot
         fig, axes = plt.subplots(1,2, figsize=(10,4))
         sns.countplot(x=x_cat, ax=axes[0], palette='pastel')
         axes[0].set_title(f'{var_names[0]} Categories')
         sns.countplot(x=y_cat, ax=axes[1], palette='pastel')
         axes[1].set_title(f'{var_names[1]} Categories')
         plt.show()
+        
+        # Scatter of continuous similarity
+        plt.figure(figsize=(6,4))
+        sns.scatterplot(x=x, y=y)
+        plt.title(f'Scatter plot of {var_names[0]} vs {var_names[1]}')
+        plt.show()
+    
+    return rmi_score
 
-    # Count matches
-    exact_matches = np.sum(x_cat == y_cat)
-    near_matches = np.sum(np.abs(x_cat - y_cat) == 1)
-    total = len(x_cat)
-
-    score = (exact_matches + alpha * near_matches) / total
-    return score
-
-def permutation_test(x, y, n_perm=1000, num_categories=3, alpha=0.5, random_state=None, plot=False):
+def permutation_test(x, y, n_perm=1000, num_categories=3, alpha=None, hybrid=True, random_state=None, plot=False):
     """
-    Perform permutation test for RMI significance.
-    Returns dict with empirical p-value and null distribution.
-    Optionally plots permutation distribution with observed statistic.
+    Permutation test for RMI significance.
+    Returns p-value and permutation distribution.
     """
     rng = np.random.default_rng(random_state)
-    observed_rmi = rmi_single_pair(x, y, num_categories, alpha)
-    perm_rmis = np.zeros(n_perm)
+    observed = compute_rmi(x, y, num_categories, alpha, hybrid)
+    perm_stats = np.zeros(n_perm)
     for i in range(n_perm):
         y_perm = rng.permutation(y)
-        perm_rmis[i] = rmi_single_pair(x, y_perm, num_categories, alpha)
-    emp_p = (np.sum(perm_rmis >= observed_rmi) + 1) / (n_perm + 1)
-
+        perm_stats[i] = compute_rmi(x, y_perm, num_categories, alpha, hybrid)
+    p_val = (np.sum(perm_stats >= observed) + 1) / (n_perm + 1)
+    
     if plot:
         plt.figure(figsize=(8,4))
-        sns.histplot(perm_rmis, bins=30, kde=True, color='lightgray')
-        plt.axvline(observed_rmi, color='red', linestyle='--', label=f'Observed RMI = {observed_rmi:.3f}')
+        sns.histplot(perm_stats, bins=30, color='lightgray', kde=True)
+        plt.axvline(observed, color='red', linestyle='--', label=f'Observed RMI = {observed:.3f}')
         plt.title('Permutation Test Distribution')
-        plt.xlabel('RMI under Null (Permutations)')
+        plt.xlabel('RMI under Null')
         plt.ylabel('Frequency')
         plt.legend()
         plt.show()
+    
+    return {'p_value': p_val, 'observed_rmi': observed, 'perm_distribution': perm_stats}
 
-    return {'emp_p': emp_p, 'observed_rmi': observed_rmi, 'perm_distribution': perm_rmis}
-
-def batch_pairwise_rlma(X_df, y, n_perm=1000, num_categories=3, alpha=0.5, random_state=None, plot=False):
+def batch_rlma(X_df, y, num_categories=3, alpha=None, hybrid=True, n_perm=1000,
+               random_state=None, n_jobs=1, plot=False):
     """
-    Run RLMA on all columns in X_df against y.
-    Returns a DataFrame with RMI and p-values.
-    If plot=True, plots RMI values for all variables.
+    Batch RLMA for multiple IVs in X_df against y.
+    Runs permutation tests in parallel if n_jobs > 1.
+    Returns DataFrame with variables, RMIs, p-values.
     """
-    results = []
-    for col in X_df.columns:
-        rmi = rmi_single_pair(X_df[col], y, num_categories, alpha)
-        perm = permutation_test(X_df[col], y, n_perm, num_categories, alpha, random_state)
-        results.append({'Variable': col, 'RMI': rmi, 'p_value': perm['emp_p']})
+    def single_rlma(col):
+        rmi = compute_rmi(X_df[col], y, num_categories, alpha, hybrid)
+        perm_res = permutation_test(X_df[col], y, n_perm, num_categories, alpha, hybrid, random_state)
+        return {'Variable': col, 'RMI': rmi, 'p_value': perm_res['p_value']}
+    
+    results = Parallel(n_jobs=n_jobs)(delayed(single_rlma)(col) for col in X_df.columns)
     df_results = pd.DataFrame(results).sort_values(by='RMI', ascending=False).reset_index(drop=True)
-
+    
     if plot:
-        plt.figure(figsize=(10,5))
-        sns.barplot(data=df_results, x='Variable', y='RMI', palette='viridis')
-        plt.xticks(rotation=45)
-        plt.title('Batch RLMA: RMI Scores per Variable')
-        plt.show()
-
+        fig = px.bar(df_results, x='Variable', y='RMI',
+                     title='Batch RLMA Scores per Variable',
+                     labels={'RMI': 'Robust Linear Matching Index'})
+        fig.show()
+    
     return df_results
 
-def composite_rlma(X_df, y, method='ridge', n_perm=1000, num_categories=3, alpha=0.5, random_state=None, plot=False):
+def composite_rlma(X_df, y, method='pca', num_categories=3, alpha=None, hybrid=True,
+                  n_perm=1000, random_state=None, plot=False):
     """
-    Composite RLMA using predicted composite IV from PCA, Ridge, or Random Forest.
-    - method: 'pca', 'ridge', or 'rf'
-    Returns dict with RMI and permutation test results.
-    Optionally plots permutation distribution.
+    Composite RLMA combining all IVs into one predictor via PCA, Ridge, or RF.
+    Runs permutation test on composite predictor.
     """
     rng = np.random.default_rng(random_state)
     X_np = np.asarray(X_df)
     y_np = np.asarray(y)
-
+    
     if method == 'pca':
         pca = PCA(n_components=1)
         X_comp = pca.fit_transform(X_np).flatten()
@@ -193,27 +215,27 @@ def composite_rlma(X_df, y, method='ridge', n_perm=1000, num_categories=3, alpha
         rf.fit(X_np, y_np)
         X_comp = rf.predict(X_np)
     else:
-        raise ValueError("method must be 'pca', 'ridge', or 'rf'")
-
-    rmi_val = rmi_single_pair(X_comp, y_np, num_categories, alpha)
-
+        raise ValueError("Invalid method; choose 'pca', 'ridge', or 'rf'")
+    
+    rmi_val = compute_rmi(X_comp, y_np, num_categories, alpha, hybrid)
+    
     perm_rmis = np.zeros(n_perm)
     for i in range(n_perm):
         y_perm = rng.permutation(y_np)
         if method == 'pca':
-            X_comp_perm = X_comp
+            X_comp_perm = X_comp  # PCA doesn't change by y
         elif method == 'ridge':
             ridge_perm = Ridge(alpha=1.0, random_state=random_state)
             ridge_perm.fit(X_np, y_perm)
             X_comp_perm = ridge_perm.predict(X_np)
-        elif method == 'rf':
+        else:  # rf
             rf_perm = RandomForestRegressor(random_state=random_state)
             rf_perm.fit(X_np, y_perm)
             X_comp_perm = rf_perm.predict(X_np)
-        perm_rmis[i] = rmi_single_pair(X_comp_perm, y_perm, num_categories, alpha)
-
+        perm_rmis[i] = compute_rmi(X_comp_perm, y_perm, num_categories, alpha, hybrid)
+    
     emp_p = (np.sum(perm_rmis >= rmi_val) + 1) / (n_perm + 1)
-
+    
     if plot:
         plt.figure(figsize=(8,4))
         sns.histplot(perm_rmis, bins=30, kde=True, color='lightgray')
@@ -223,6 +245,49 @@ def composite_rlma(X_df, y, method='ridge', n_perm=1000, num_categories=3, alpha
         plt.ylabel('Frequency')
         plt.legend()
         plt.show()
+    
+    return {'rmi_result': rmi_val, 'perm_p_value': emp_p, 'perm_distribution': perm_rmis}
 
-    return {'rmi_result': rmi_val, 'perm_result': {'emp_p': emp_p, 'perm_distribution': perm_rmis}}
+def variable_importance(X_df, y, model='rf', random_state=None):
+    """
+    Compute variable importance scores using Ridge or Random Forest.
+    Returns DataFrame with variables and importances.
+    """
+    X_np = np.asarray(X_df)
+    y_np = np.asarray(y)
+    if model == 'ridge':
+        mdl = Ridge(alpha=1.0, random_state=random_state)
+        mdl.fit(X_np, y_np)
+        importances = np.abs(mdl.coef_)
+    elif model == 'rf':
+        mdl = RandomForestRegressor(random_state=random_state)
+        mdl.fit(X_np, y_np)
+        importances = mdl.feature_importances_
+    else:
+        raise ValueError("model must be 'ridge' or 'rf'")
+    df_imp = pd.DataFrame({'Variable': X_df.columns, 'Importance': importances})
+    return df_imp.sort_values(by='Importance', ascending=False).reset_index(drop=True)
 
+def classical_associations(x, y):
+    """
+    Compute classical association metrics:
+    - Spearman correlation and p-value
+    - Mutual Information (discrete bins)
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    spearman_corr, spearman_p = spearmanr(x, y)
+    
+    # Discretize for MI
+    num_bins = min(10, len(np.unique(x)))
+    x_disc = categorize_variable(x, num_categories=num_bins)
+    y_disc = categorize_variable(y, num_categories=num_bins)
+    mi = mutual_info_score(x_disc, y_disc)
+    
+    return {'spearman_corr': spearman_corr, 'spearman_p': spearman_p, 'mutual_info': mi}
+
+# Placeholder for CLI interface (future)
+def cli_interface():
+    print("RLMA CLI interface coming soon!")
+
+# ------------------- END OF MODULE -------------------
